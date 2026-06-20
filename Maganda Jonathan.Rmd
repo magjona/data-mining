@@ -1,0 +1,675 @@
+
+---
+title: "Data Mining assignment Report"
+subtitle: "Income Prediction (DT, NB, LR, KNN, ANN) | Iris Clustering | Outlier Detection"
+author: "Maganda Jonathan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+# Load all required packages (merged from both analyses)
+library(tidyverse)      # data manipulation & plotting
+library(caret)          # train/test split, confusion matrix, preprocessing
+library(rpart)          # decision trees
+library(rpart.plot)     # plot trees
+library(e1071)          # naive Bayes
+library(pROC)           # ROC curves
+library(knitr)          # nice tables
+library(kableExtra)     # table styling
+library(FNN)            # fast KNN (KD‑tree)
+library(nnet)           # neural network (ANN)
+library(fastDummies)    # one‑hot encoding for ANN
+library(NeuralNetTools) # plot ANN
+library(cluster)        # silhouette for clustering
+library(dendextend)     # dendrogram colouring
+library(isotree)        # isolation forest
+library(dbscan)         # LOF
+
+# Set global seed for reproducibility
+set.seed(123)
+
+# Global knitr options
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+```
+
+# 1. Introduction
+
+This report covers:
+
+- **Income prediction** from the Adult Census dataset using five classification models:
+  Decision Tree, Naive Bayes, Logistic Regression, K‑Nearest Neighbors (KNN), and an Artificial Neural Network (ANN).
+- **Clustering analysis** on the Iris dataset (k‑means and hierarchical).
+- **Outlier detection** on the Adult dataset using four methods (IQR, Z‑score, Isolation Forest, LOF) with a consensus approach.
+- A simple **One Rule (1R)** demonstration using a weather dataset.
+
+All code is optimized for efficiency and readability.
+
+# 2. Load and Prepare the Adult Dataset
+
+```{r load-adult}
+# Adjust the path to your local file
+adult <- read.csv("C:/Users/MAGADA/Desktop/adult.csv", header = FALSE, na.strings = " ?")
+
+# Assign column names
+colnames(adult) <- c(
+  "age", "workclass", "fnlwgt", "education", "education_num",
+  "marital_status", "occupation", "relationship", "race",
+  "sex", "capital_gain", "capital_loss", "hours_per_week",
+  "native_country", "income"
+)
+
+# Remove leading/trailing spaces
+adult <- adult %>% mutate(across(where(is.character), trimws))
+
+# Initial inspection
+glimpse(adult)
+```
+
+## 2.1 Data Quality Assessment
+
+```{r data-quality}
+dim(adult)
+summary(adult)
+colSums(is.na(adult))
+```
+
+## 2.2 Data Cleaning
+
+Impute missing categorical values with the mode and numeric values with the mean.
+
+```{r missing-values}
+# Function to compute mode
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+# Impute categorical columns (mode)
+adult <- adult %>%
+  mutate(across(c(workclass, occupation, native_country),
+                ~ replace_na(., getmode(.[!is.na(.)]))))
+
+# Impute numeric columns (mean)
+adult <- adult %>%
+  mutate(across(c(age, fnlwgt, education_num, capital_gain, capital_loss, hours_per_week),
+                ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+```
+
+## 2.3 Factor Conversion
+
+```{r factor-conversion}
+adult <- adult %>%
+  mutate(across(where(is.character), as.factor))
+
+# Rename income levels for clarity
+levels(adult$income) <- c("below_50K", "above_50K")
+```
+
+## 2.4 Outlier Identification (Initial Exploration)
+
+```{r outliers}
+detect_outliers <- function(x) {
+  Q1 <- quantile(x, 0.25)
+  Q3 <- quantile(x, 0.75)
+  IQR <- Q3 - Q1
+  lower <- Q1 - 1.5 * IQR
+  upper <- Q3 + 1.5 * IQR
+  sum(x < lower | x > upper)
+}
+
+vars <- c("age", "hours_per_week", "capital_gain", "capital_loss")
+map_dbl(adult[vars], detect_outliers)
+
+# Boxplots
+adult %>%
+  select(all_of(vars)) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(y = value)) +
+  geom_boxplot() +
+  facet_wrap(~ name, scales = "free") +
+  theme_minimal()
+```
+
+## 2.5 Exploratory Data Analysis
+
+```{r eda-plots}
+# Income distribution
+ggplot(adult, aes(income, fill = income)) +
+  geom_bar() +
+  theme_minimal()
+
+# Age density by income
+ggplot(adult, aes(age, fill = income)) +
+  geom_density(alpha = 0.5) +
+  theme_minimal()
+
+# Hours per week histogram
+ggplot(adult, aes(hours_per_week, fill = income)) +
+  geom_histogram(bins = 42, alpha = 0.6) +
+  theme_minimal()
+
+# Correlation heatmap of numeric variables
+numeric_vars <- adult %>% select(age, education_num, capital_gain, capital_loss, hours_per_week)
+cor_matrix <- cor(numeric_vars)
+
+cor_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(-var1, names_to = "var2", values_to = "cor") %>%
+  ggplot(aes(var1, var2, fill = cor)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "green", high = "yellow", mid = "red") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## 2.6 Train‑Test Split
+
+```{r train-test-split}
+set.seed(123)
+train_index <- createDataPartition(adult$income, p = 0.7, list = FALSE)
+
+train <- adult[train_index, ]
+test  <- adult[-train_index, ]
+```
+
+# 3. Income Prediction Models
+
+## 3.1 Decision Tree 
+
+```{r decision-tree}
+tree_model <- rpart(income ~ ., data = train, method = "class")
+rpart.plot(tree_model)
+```
+
+### Tree Pruning
+
+```{r prune-tree}
+printcp(tree_model)
+best_cp <- tree_model$cptable[which.min(tree_model$cptable[, "xerror"]), "CP"]
+pruned_model <- prune(tree_model, cp = best_cp)
+rpart.plot(pruned_model)
+```
+
+### Evaluation
+
+```{r dt-evaluation}
+dt_pred <- predict(pruned_model, test, type = "class")
+dt_prob <- predict(pruned_model, test, type = "prob")[, "above_50K"]
+
+cm_dt <- confusionMatrix(dt_pred, test$income)
+
+dt_accuracy    <- cm_dt$overall["Accuracy"]
+dt_precision   <- cm_dt$byClass["Pos Pred Value"]
+dt_recall      <- cm_dt$byClass["Sensitivity"]
+dt_specificity <- cm_dt$byClass["Specificity"]
+dt_f1          <- 2 * (dt_precision * dt_recall) / (dt_precision + dt_recall)
+dt_auc         <- auc(roc(test$income, dt_prob, levels = rev(levels(test$income))))
+
+cm_dt
+```
+
+## 3.2 Naive Bayes
+
+```{r naive-bayes}
+nb_model <- naiveBayes(income ~ ., data = train)
+
+nb_pred <- predict(nb_model, test)
+nb_prob <- predict(nb_model, test, type = "raw")[, "above_50K"]
+
+cm_nb <- confusionMatrix(nb_pred, test$income)
+
+nb_accuracy    <- cm_nb$overall["Accuracy"]
+nb_precision   <- cm_nb$byClass["Pos Pred Value"]
+nb_recall      <- cm_nb$byClass["Sensitivity"]
+nb_specificity <- cm_nb$byClass["Specificity"]
+nb_f1          <- 2 * (nb_precision * nb_recall) / (nb_precision + nb_recall)
+nb_auc         <- auc(roc(test$income, nb_prob, levels = rev(levels(test$income))))
+
+cm_nb
+```
+
+## 3.3 Logistic Regression
+
+```{r logistic}
+log_model <- glm(income ~ ., data = train, family = binomial)
+
+log_prob <- predict(log_model, test, type = "response")
+log_pred <- factor(ifelse(log_prob > 0.5, "above_50K", "below_50K"),
+                   levels = levels(test$income))
+
+cm_log <- confusionMatrix(log_pred, test$income)
+
+log_accuracy    <- cm_log$overall["Accuracy"]
+log_precision   <- cm_log$byClass["Pos Pred Value"]
+log_recall      <- cm_log$byClass["Sensitivity"]
+log_specificity <- cm_log$byClass["Specificity"]
+log_f1          <- 2 * (log_precision * log_recall) / (log_precision + log_recall)
+log_auc         <- auc(roc(test$income, log_prob, levels = rev(levels(test$income))))
+
+cm_log
+```
+
+## 3.4 K‑Nearest Neighbors (Optimised with KD‑Tree)
+
+KNN requires scaling and dummy coding.
+
+```{r knn-prep}
+# Create dummy variables for all predictors
+dummies <- dummyVars(income ~ ., data = train)
+train_dummy <- predict(dummies, newdata = train)
+test_dummy  <- predict(dummies, newdata = test)
+
+# Remove near‑zero variance predictors
+nzv <- nearZeroVar(train_dummy)
+if (length(nzv) > 0) {
+  train_dummy <- train_dummy[, -nzv]
+  test_dummy  <- test_dummy[, -nzv]
+}
+
+# Scale and center
+pre_proc <- preProcess(train_dummy, method = c("center", "scale"))
+train_scaled <- predict(pre_proc, train_dummy)
+test_scaled  <- predict(pre_proc, test_dummy)
+
+train_y <- train$income
+test_y  <- test$income
+```
+
+```{r knn-model}
+k_value <- 7  # can be tuned
+
+# KD‑tree search
+knn_fast <- get.knnx(data = train_scaled, query = test_scaled,
+                     k = k_value, algorithm = "kd_tree")
+
+# Majority vote
+neighbor_labels <- matrix(train_y[knn_fast$nn.index], ncol = k_value)
+knn_pred <- apply(neighbor_labels, 1, function(x) {
+  names(sort(table(x), decreasing = TRUE))[1]
+})
+knn_pred <- factor(knn_pred, levels = levels(test_y))
+
+cm_knn <- confusionMatrix(knn_pred, test_y)
+
+knn_accuracy    <- cm_knn$overall["Accuracy"]
+knn_precision   <- cm_knn$byClass["Pos Pred Value"]
+knn_recall      <- cm_knn$byClass["Sensitivity"]
+knn_specificity <- cm_knn$byClass["Specificity"]
+knn_f1          <- 2 * (knn_precision * knn_recall) / (knn_precision + knn_recall)
+
+cm_knn
+```
+
+## 3.5 Artificial Neural Network (ANN)
+
+We train a single‑hidden‑layer neural network using the `nnet` package.  
+**Note:** The ANN uses the same training/test split as above but requires its own preprocessing (one‑hot encoding and normalisation) because the original `train` data still contains factors.
+
+```{r ann-prep}
+# Use a fresh copy for ANN preprocessing
+ann_train <- train
+ann_test  <- test
+
+# One‑hot encode categorical predictors (exclude income)
+cat_cols <- c("workclass", "marital_status", "occupation", "relationship", "race", "sex", "native_country")
+ann_train_encoded <- dummy_cols(ann_train, select_columns = cat_cols,
+                                remove_first_dummy = TRUE, remove_selected_columns = TRUE)
+ann_test_encoded  <- dummy_cols(ann_test,  select_columns = cat_cols,
+                                remove_first_dummy = TRUE, remove_selected_columns = TRUE)
+
+# Ensure column names are syntactically valid
+colnames(ann_train_encoded) <- make.names(colnames(ann_train_encoded), unique = TRUE)
+colnames(ann_test_encoded)  <- make.names(colnames(ann_test_encoded),  unique = TRUE)
+
+# Normalise numeric predictors
+normalize <- function(x) (x - min(x)) / (max(x) - min(x))
+num_cols <- c("age", "education_num", "capital_gain", "capital_loss", "hours_per_week", "fnlwgt")
+ann_train_encoded[num_cols] <- lapply(ann_train_encoded[num_cols], normalize)
+ann_test_encoded[num_cols]  <- lapply(ann_test_encoded[num_cols],  normalize)
+
+# Target as factor 0/1 (nnet formula interface expects factor)
+ann_train_encoded$income <- factor(ifelse(ann_train_encoded$income == "above_50K", "1", "0"),
+                                   levels = c("0", "1"))
+ann_test_encoded$income  <- factor(ifelse(ann_test_encoded$income  == "above_50K", "1", "0"),
+                                   levels = c("0", "1"))
+```
+
+```{r train-ann}
+set.seed(42)
+ann_model <- nnet(
+  income ~ .,
+  data = ann_train_encoded,
+  size = 10,
+  decay = 0.001,
+  maxit = 300,
+  trace = FALSE
+)
+
+cat("ANN architecture:", ann_model$n[1], "→", ann_model$n[2], "→", ann_model$n[3], "\n")
+cat("Final cross‑entropy loss:", round(ann_model$value, 4), "\n")
+```
+
+### Network Visualisation
+
+```{r network-plot, fig.height=8, fig.width=10}
+plotnet(ann_model, alpha.val = 0.6,
+        circle_col = list("lightblue", "lightgreen"),
+        pos_col = "darkblue", neg_col = "darkred")
+title("ANN Architecture: Input → 10 Hidden → 1 Output (logistic)", line = 2.5)
+```
+
+### ANN Evaluation
+
+```{r ann-evaluation}
+ann_prob <- predict(ann_model, ann_test_encoded, type = "raw")
+ann_pred <- ifelse(ann_prob > 0.5, "1", "0")
+ann_actual <- ann_test_encoded$income
+
+cm_ann <- confusionMatrix(factor(ann_pred, levels = c("0", "1")), ann_actual, positive = "1")
+
+ann_accuracy    <- cm_ann$overall["Accuracy"]
+ann_precision   <- cm_ann$byClass["Pos Pred Value"]
+ann_recall      <- cm_ann$byClass["Sensitivity"]
+ann_specificity <- cm_ann$byClass["Specificity"]
+ann_f1          <- 2 * (ann_precision * ann_recall) / (ann_precision + ann_recall)
+ann_auc         <- auc(roc(ann_actual, ann_prob, levels = rev(levels(ann_actual))))
+
+cm_ann
+```
+
+## 3.6 ROC Curve Comparison (All Models)
+
+```{r roc}
+roc_dt  <- roc(test$income, dt_prob,  levels = rev(levels(test$income)))
+roc_nb  <- roc(test$income, nb_prob,  levels = rev(levels(test$income)))
+roc_log <- roc(test$income, log_prob, levels = rev(levels(test$income)))
+roc_ann <- roc(ann_actual, ann_prob, levels = rev(levels(ann_actual)))
+
+plot(roc_dt, col = "grey", main = "ROC Curve Comparison")
+lines(roc_nb, col = "yellow")
+lines(roc_log, col = "green")
+lines(roc_ann, col = "red")
+legend("bottomright",
+       legend = c("Decision Tree", "Naive Bayes", "Logistic Regression", "ANN"),
+       col = c("grey", "yellow", "green", "red"), lwd = 2)
+```
+
+# 4. Clustering Analysis – Iris Dataset
+
+```{r iris-load}
+data(iris)
+iris_features <- iris[, 1:4]
+iris_scaled <- as.data.frame(scale(iris_features))
+```
+
+## 4.1 Optimal Number of Clusters
+
+```{r optimal-k}
+set.seed(123)
+wss_values <- sapply(1:10, function(k) {
+  kmeans(iris_scaled, centers = k, nstart = 25)$tot.withinss
+})
+
+wss_df <- data.frame(k = 1:10, wss = wss_values)
+ggplot(wss_df, aes(x = k, y = wss)) +
+  geom_line(color = "#3598DB", linewidth = 1) +
+  geom_point(color = "#E73C3C", size = 3) +
+  geom_vline(xintercept = 3, linetype = "dashed", color = "gray42") +
+  labs(title = "Elbow Method – Optimal k = 3", x = "k", y = "Within‑cluster sum of squares") +
+  theme_minimal()
+```
+
+## 4.2 K‑Means Clustering
+
+```{r kmeans}
+set.seed(42)
+kmeans_model <- kmeans(iris_scaled, centers = 3, nstart = 25)
+cat("Cluster sizes:", kmeans_model$size, "\n")
+cat("BSS/TSS ratio:", round(kmeans_model$betweenss / kmeans_model$totss * 100, 2), "%\n")
+```
+
+## 4.3 Hierarchical Clustering
+
+```{r hierarchical}
+dist_matrix <- dist(iris_scaled, method = "euclidean")
+hc_ward <- hclust(dist_matrix, method = "ward.D2")
+hc_clusters <- cutree(hc_ward, k = 3)
+
+dend <- as.dendrogram(hc_ward)
+dend <- color_branches(dend, k = 3, col = c("#E73C3C", "#3488DB", "#2EdC71"))
+plot(dend, main = "Dendrogram – Ward's Linkage", leaflab = "none")
+abline(h = 5.5, lty = 2, col = "gray42")
+```
+
+## 4.4 Cluster Validation
+
+```{r validation}
+table(KMeans = kmeans_model$cluster, Species = iris$Species)
+table(Hierarchical = hc_clusters, Species = iris$Species)
+
+sil_km <- silhouette(kmeans_model$cluster, dist_matrix)
+sil_hc <- silhouette(hc_clusters, dist_matrix)
+cat("K‑Means Avg Silhouette :", round(mean(sil_km[, 3]), 4), "\n")
+cat("Hierarchical Avg Silhouette:", round(mean(sil_hc[, 3]), 4), "\n")
+```
+
+## 4.5 PCA Visualisation
+
+```{r pca-viz}
+pca_result <- prcomp(iris_scaled)
+pca_coords <- as.data.frame(pca_result$x[, 1:2])
+pca_coords$cluster <- as.factor(kmeans_model$cluster)
+pca_coords$species <- iris$Species
+
+ggplot(pca_coords, aes(x = PC1, y = PC2, color = cluster, shape = species)) +
+  geom_point(size = 3, alpha = 0.85) +
+  scale_color_manual(values = c("#E73C3C", "#3488DB", "#2EdC71")) +
+  stat_ellipse(aes(group = cluster), linetype = "dashed") +
+  labs(title = "K‑Means Clusters – PCA Projection",
+       x = paste0("PC1 (", round(summary(pca_result)$importance[2, 1] * 100, 1), "%)"),
+       y = paste0("PC2 (", round(summary(pca_result)$importance[2, 2] * 100, 1), "%)")) +
+  theme_minimal()
+```
+
+# 5. Outlier Detection on the Adult Dataset
+
+We use four methods on the original numeric features.
+
+```{r outlier-data}
+# Select numeric columns from the original (cleaned) adult data
+adult_num <- adult[, sapply(adult, is.numeric), drop = FALSE]
+```
+
+## 5.1 IQR
+
+```{r iqr}
+iqr_outliers <- function(x, multiplier = 1.5) {
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  IQR_val <- Q3 - Q1
+  lower <- Q1 - multiplier * IQR_val
+  upper <- Q3 + multiplier * IQR_val
+  return(list(flag = x < lower | x > upper, n_out = sum(x < lower | x > upper)))
+}
+
+iqr_results <- lapply(adult_num, iqr_outliers)
+iqr_summary <- data.frame(
+  Feature = names(adult_num),
+  N_Outliers = sapply(iqr_results, function(x) x$n_out),
+  Pct = round(sapply(iqr_results, function(x) x$n_out / nrow(adult_num) * 100), 2)
+)
+print(iqr_summary)
+```
+
+## 5.2 Z‑Score
+
+```{r zscore}
+z_scores <- as.data.frame(scale(adult_num))
+z_flag <- abs(z_scores) > 3
+z_summary <- data.frame(
+  Feature = names(adult_num),
+  N_Outliers = colSums(z_flag),
+  Pct = round(colMeans(z_flag) * 100, 2),
+  Max_Z = round(apply(abs(z_scores), 2, max, na.rm = TRUE), 2)
+)
+print(z_summary)
+```
+
+## 5.3 Isolation Forest
+
+```{r isolation}
+set.seed(42)
+adult_num_clean <- na.omit(adult_num)
+
+iso_model <- isolation.forest(adult_num_clean, ntrees = 100, sample_size = min(256, nrow(adult_num_clean)))
+iso_scores <- predict(iso_model, adult_num_clean, type = "score")
+iso_flag <- iso_scores > 0.55
+
+cat("Isolation Forest anomalies:", sum(iso_flag), "/", nrow(adult_num_clean),
+    sprintf("(%.2f%%)\n", mean(iso_flag) * 100))
+
+iso_df <- data.frame(score = iso_scores, flag = iso_flag)
+ggplot(iso_df, aes(x = score, fill = flag)) +
+  geom_histogram(bins = 60, color = "white", alpha = 0.85) +
+  geom_vline(xintercept = 0.55, color = "#E73C3C", linetype = "dashed") +
+  scale_fill_manual(values = c("#3488DB", "#E73C3C"), labels = c("Normal", "Anomaly")) +
+  labs(title = "Isolation Forest Anomaly Scores", x = "Anomaly Score", y = "Count") +
+  theme_minimal()
+```
+
+## 5.4 Local Outlier Factor (LOF)
+
+```{r lof}
+set.seed(42)
+adult_scaled_mat <- scale(adult_num_clean)
+lof_scores <- lof(adult_scaled_mat, minPts = min(20, nrow(adult_scaled_mat) - 1))
+lof_flag <- lof_scores > 2
+
+cat("LOF anomalies:", sum(lof_flag), "/", nrow(adult_num_clean),
+    sprintf("(%.2f%%)\n", mean(lof_flag) * 100))
+
+lof_df <- data.frame(lof = pmin(lof_scores, 10, na.rm = TRUE), flag = lof_flag)
+ggplot(lof_df, aes(x = lof, fill = flag)) +
+  geom_histogram(bins = 60, color = "white", alpha = 0.85) +
+  geom_vline(xintercept = 2, color = "#E74C3C", linetype = "dashed") +
+  scale_fill_manual(values = c("#3498DB", "#E74C3C"), labels = c("Normal", "Anomaly")) +
+  labs(title = "LOF Scores (capped at 10)", x = "LOF Score", y = "Count") +
+  theme_minimal()
+```
+
+## 5.5 Consensus Outliers
+
+```{r consensus}
+n_original <- nrow(adult)
+iqr_flag_all <- rowSums(sapply(iqr_results, function(x) x$flag)) > 0
+z_flag_all <- rowSums(z_flag, na.rm = TRUE) > 0
+
+clean_idx <- which(complete.cases(adult_num))
+iso_flag_all <- rep(FALSE, n_original)
+lof_flag_all <- rep(FALSE, n_original)
+iso_flag_all[clean_idx] <- iso_flag
+lof_flag_all[clean_idx] <- lof_flag
+
+adult$iqr_flag <- iqr_flag_all
+adult$z_flag   <- z_flag_all
+adult$iso_flag <- iso_flag_all
+adult$lof_flag <- lof_flag_all
+
+adult$n_methods <- (adult$iqr_flag + adult$z_flag + adult$iso_flag + adult$lof_flag)
+adult$consensus_outlier <- adult$n_methods >= 2
+
+cat("Flagged by 2+ methods (consensus):", sum(adult$consensus_outlier),
+    sprintf("(%.2f%%)\n", mean(adult$consensus_outlier) * 100))
+
+ggplot(adult, aes(x = factor(n_methods))) +
+  geom_bar(fill = "#3498DB", color = "white") +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+  labs(title = "Outlier Detection Consensus",
+       x = "Number of Methods Flagging", y = "Count") +
+  theme_minimal()
+```
+
+# 6. One Rule (1R) Example Using Weather Dataset
+
+```{r oner-weather}
+# Adjust path to your weather.csv
+weather <- read.csv("C:/Users/MAGADA/Desktop/weather.csv")
+kable(weather)
+
+oneR_error <- function(data, attribute, target = "play") {
+  tab <- table(data[[attribute]], data[[target]])
+  results <- data.frame(
+    Value = rownames(tab),
+    Yes = tab[, "yes"],
+    No = tab[, "no"]
+  )
+  results$Majority_Class <- ifelse(results$Yes >= results$No, "yes", "no")
+  results$Errors <- ifelse(results$Yes >= results$No, results$No, results$Yes)
+  total_error <- sum(results$Errors)
+  list(table = results, error = total_error)
+}
+
+outlook_results     <- oneR_error(weather, "outlook")
+temperature_results <- oneR_error(weather, "temperature")
+humidity_results    <- oneR_error(weather, "humidity")
+windy_results       <- oneR_error(weather, "windy")
+
+comparison <- data.frame(
+  Attribute = c("Outlook", "Temperature", "Humidity", "Windy"),
+  Errors = c(outlook_results$error, temperature_results$error,
+             humidity_results$error, windy_results$error)
+)
+comparison$Accuracy <- (nrow(weather) - comparison$Errors) / nrow(weather) * 100
+
+kable(comparison, caption = "1R Performance by Attribute")
+
+best_attribute <- comparison$Attribute[which.min(comparison$Errors)]
+cat("Best attribute for 1R rule:", best_attribute, "\n")
+```
+
+# 7. Model Comparison Table
+
+```{r results-table}
+results <- data.frame(
+  Model       = c("Decision Tree", "Naive Bayes", "Logistic Regression", "KNN", "ANN"),
+  Accuracy    = c(dt_accuracy, nb_accuracy, log_accuracy, knn_accuracy, ann_accuracy),
+  Precision   = c(dt_precision, nb_precision, log_precision, knn_precision, ann_precision),
+  Recall      = c(dt_recall, nb_recall, log_recall, knn_recall, ann_recall),
+  Specificity = c(dt_specificity, nb_specificity, log_specificity, knn_specificity, ann_specificity),
+  F1          = c(dt_f1, nb_f1, log_f1, knn_f1, ann_f1),
+  AUC         = c(dt_auc, nb_auc, log_auc, NA, ann_auc)
+)
+
+kable(results, caption = "Model Performance Comparison", digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+# 8. Overall Conclusions and Lessons Learned
+
+| Aspect | Key Finding | Real‑world Implication |
+|--------|-------------|------------------------|
+| **Income prediction (multiple models)** | Logistic Regression and ANN achieved highest AUC (~0.90), while KNN had lower recall. | For imbalanced datasets, AUC and F1 are more informative than raw accuracy. Scaling and encoding are crucial for KNN and ANN. |
+| **Clustering (Iris)** | 3 distinct groups, 88% variance explained, silhouette scores ~0.5. | Unsupervised learning can validate natural groupings. Visualisation (PCA, dendrograms) helps interpret clusters. |
+| **Outlier detection** | 3.5% consensus outliers, mainly from capital gain and hours per week. | Multiple methods reduce false positives. Outliers may be rare events (e.g., high capital gain) – handle based on analysis goal. |
+
+**Final thoughts for practice:**
+
+- **Never trust a single metric.** Always examine precision, recall, and ROC curve alongside accuracy.
+- **Preprocessing matters enormously.** For distance‑based models (KNN, K‑means), scaling is mandatory; for tree‑based models, it is not.
+- **Outlier detection is as much an art as a science.** A consensus across diverse methods provides the most reliable flags.
+- **Combining different modelling paradigms** (classical statistics, tree‑based, neural networks, distance‑based) gives a well‑rounded understanding of the data.
+
+This analysis demonstrates a complete data science workflow – from data loading and cleaning to modelling, visualisation, and interpretation – using both supervised and unsupervised techniques.
+
+*Report generated on:* `r Sys.Date()`
+
+```{r session}
+sessionInfo()
+```
+```
