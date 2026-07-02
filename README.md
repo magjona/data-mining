@@ -1,4 +1,4 @@
-# Data Mining — Computing Assignment (Semester 2)
+# Data Mining Assignment "Semester 2"
 
 This repository contains a data mining project completed as part of a computing course assignment, applying core data mining techniques — classification, clustering, and outlier detection — across multiple benchmark datasets in R.
 
